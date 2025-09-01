@@ -1,0 +1,161 @@
+---
+import Layout from "../layouts/Layout.astro"
+import {LockKeyhole,LockKeyholeOpen} from "@lucide/astro"
+---
+<Layout title="StegURL">
+  <div class="flex flex-col p-4 mx-6 lg:mx-14 2xl:mx-42">
+    <div class="flex flex-col md:flex-row gap-6 lg:gap-12">
+      <div class="py-6 flex flex-col gap-6 flex-1">
+        <textarea class="textarea textarea-info w-full h-136 bg-base-200 rounded-lg" id="secret"></textarea>
+      </div>
+      <div class="flex flex-col items-center justify-center gap-8">
+        <button class=`btn btn-primary btn-circle btn-xl` id="hide"><LockKeyhole/></button>
+        <button class="btn btn-secondary btn-circle btn-xl" id="extract"><LockKeyholeOpen/></button>
+      </div>
+      <div class="py-6 flex flex-col gap-6 flex-1">
+        <textarea class="textarea textarea-info w-full h-136 bg-base-200 rounded-lg" id="coverText"></textarea>
+      </div>
+    </div>
+  </div>
+  <script>
+    import { $,setLang,shorten} from "../assets/commonUtils";
+    import RandExp from 'randexp';
+    let failMsg;
+    [$('secret').placeholder,
+    $('coverText').placeholder,
+    failMsg]=setLang({
+        "zh-CN":["输入有效链接","输入待解析链接",""],
+        "zh-TW":["輸入需加密的資訊","輸入需解密的掩飾文本",""],
+        "en":["Enter the message to encrypt","Enter the cover text to decrypt",""]})
+    $('hide').onclick = async () => {
+      $('coverText').value=convert($('secret').value);
+    };
+    $('extract').onclick = async () => {
+      $('secret').value=extract($('coverText').value);
+    };
+function buildEqualWeightTruncatedBinary() {
+  const alphabet = ["e","t","a","o","i","n","s","h","r","d","l","c","u","m","w","f","g","y","p","b","v","k","0","1","2","3","4","5","6","7","8","9","j","x","q","z","_","A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","?","=","/","&","%",".","-","@","#"];//可以为每个网站单独定制字符集，但维护成本较高
+  const n = alphabet.length,k = Math.ceil(Math.log2(n)), t = (1 << k) - n;
+  const index = new Map(alphabet.map((s, i) => [s, i]));
+  const pushBits = (arr, v, len) => { while (len--) arr.push((v >> len) & 1); };
+  const encode = (str) => {
+    const bits = [];
+    for (let c of str) {
+      const i = index.get(c);
+      if (i == null) throw new Error(`Unknown symbol: ${c}`);
+      pushBits(bits, i < t ? i : i + t, i < t ? k-1 : k);
+    }
+    return bits;
+  };
+  const decode = (bits) => {
+    let p = 0, out = '';
+    while (p < bits.length) {
+      let x = 0; for (let i = 0; i < k - 1; i++) x = x * 2 + bits[p++];
+      out += alphabet[x < t ? x : (x * 2 + bits[p++]) - t];
+    }
+    return out;
+  };
+  return { encode, decode };
+}
+// TBE + flush 终止码字
+const stego = (bits, mapping) => {
+  const n = mapping.length;
+  const k = Math.floor(Math.log2(n));
+  const m = 2 ** (k + 1) - n; // 使用 k 位的短码数量（TBE 参数）
+  // 从 pos 起读 cnt 位（高位在前）
+  const read = (pos, cnt) => {
+    let v = 0;
+    for (let j = 0; j < cnt; j++) v = v * 2 + (bits[pos + j] & 1);
+    return v;
+  };
+  const len = bits.length;
+  let out = '';
+  let i = 0;
+  // 按 TBE 解码：优先吃满一个码字（短码 k 位；否则长码 k+1 位）
+  while (i + k <= len) {
+    const b = read(i, k); // 预读 k 位
+    if (b < m) {
+      out += mapping[b]; // 短码
+      i += k;
+    } else {
+      if (i + k + 1 > len) break; // 不够长码，交给“终止码字”
+      const idx = b * 2 + (bits[i + k] & 1) - m; // 长码索引
+      out += mapping[idx];
+      i += k + 1;
+    }
+  }
+  // 终止码字：把剩余位（可为 0 位）塞进一个合法 TBE 码字中
+  const r = len - i;
+  if (r < k) {
+    // 在剩余前缀后插入终止标记 1，再补 0 到 k 位
+    const prefix = read(i, r);
+    const shift = k - r;
+    const b = prefix * 2 ** shift + 2 ** (shift - 1);
+    const idx = b < m ? b : b * 2 - m; // 短码则直接用，否则按长码（等价于补 0）
+    out += mapping[idx];
+  } else if (r === k) {
+    // 恰好剩 k 位且 b>=m：补上终止标记 1 构成长码
+    const b = read(i, k);
+    const idx = b * 2 + 1 - m;
+    out += mapping[idx];
+  }
+  return out;
+};
+const unstego = (text, mapping) => {
+  const n = mapping.length;
+  const k = Math.floor(Math.log2(n));
+  const m = (1 << (k + 1)) - n;
+  // 反向字典：符号 -> 索引
+  const dict = new Map(mapping.map((s, i) => [s, i]));
+  // 文本 -> 索引序列（按字符；如需多字符 token，请替换为自定义分词）
+  const symbols = Array.from(text, ch => dict.get(ch));
+  // 写入高位在前的二进制位
+  const pushBits = (val, len, dst) => {
+    for (let t = len - 1; t >= 0; t--) dst.push((val >> t) & 1);
+  };
+  // 根据 TBE 规则把索引 v 写成码字（v<m 用 k 位，否则用 k+1 位写 v+m）
+  const emit = (v, dst) => (v < m ? pushBits(v, k, dst) : pushBits(v + m, k + 1, dst));
+  const outBits = [];
+  // 解码除最后一个符号外的所有码字（正常 TBE 码字）
+  for (let i = 0; i + 1 < symbols.length; i++) emit(symbols[i], outBits);
+  // 最后一个为“终止码字”：还原位串，去掉所有尾随 0，再去掉最后一个 1（终止标记）
+  if (symbols.length) {
+    const buf = [];
+    emit(symbols[symbols.length - 1], buf);
+    let j = buf.length - 1;
+    while (j >= 0 && buf[j] === 0) j--; // 去尾随 0，停在最后一个 1 上
+    if (j > 0) outBits.push(...buf.slice(0, j)); // 丢掉终止标记 1
+  }
+  return outBits;
+};
+const { encode, decode }=buildEqualWeightTruncatedBinary();
+function convert(originalUrl) {
+  try {
+    console.log(originalUrl)
+    const url = new URL(shorten(originalUrl));
+    const pathAfterHost = (url.pathname + url.search + url.hash).replace(/^\/+/, '');console.log(encode(pathAfterHost));
+    if(url.hostname==='youtube.com'||url.hostname==='youtu.be'){
+        url.hostname = 'www.bilibili.com'
+        url.pathname = new RandExp('\/video\/BV1[a-zA-Z0-9]{9}\/').gen();
+        url.search = `?share_source=copy_web&vd_source=${stego(encode(pathAfterHost),["0","1","2","3","4","5","6","7","8","9","a","b","c","d","e","f"])}`;//
+    }console.log(url.href)
+    return url.href;
+  } catch (error) {
+    return `不支持的链接`;
+  }
+}
+function extract(originalUrl) {
+  try {
+    const url = new URL(originalUrl);
+    if(url.hostname==='www.bilibili.com'){
+        url.hostname = 'youtu.be'
+        const tail=decode(unstego(url.searchParams.get('vd_source'),["0","1","2","3","4","5","6","7","8","9","a","b","c","d","e","f"]))
+        url.href = url.origin + (tail && !/^[?#]/.test(tail) ? '/' : '') + tail;
+    }
+    return url.href
+  } catch (error) {
+    return `不支持的链接`;
+  }
+}
+  </script>
+</Layout>
